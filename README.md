@@ -30,7 +30,7 @@ Requires Go 1.27+. One dependency, `github.com/quic-go/quic-go`, for the
 optional HTTP/3 transport; `go build` fetches it.
 
 ```
-git clone <repo> && cd pearl
+git clone <https://github.com/Coolcubercoder/Pearl.git> && cd pearl
 go build -o pearl .
 sudo cp pearl /usr/local/bin/pearl
 ```
