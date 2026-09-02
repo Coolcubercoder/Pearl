@@ -1,0 +1,8 @@
+cff-version: 1.2.0
+message: "If you use this software or its work-stealing architecture, please cite it as below."
+authors:
+- family-names: "Coolcubercoder"
+title: "Pearl: A High-Performance Concurrent Downloader with Dynamic Work-Stealing"
+version: "1.0.0"
+date-released: 2026-08-31
+url: "https://github.com/Coolcubercoder/Pearl"
