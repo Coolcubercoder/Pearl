@@ -30,7 +30,7 @@ Requires Go 1.27+. One dependency, `github.com/quic-go/quic-go`, for the
 optional HTTP/3 transport; `go build` fetches it.
 
 ```
-git clone <https://github.com/Coolcubercoder/Pearl.git> && cd pearl
+git clone <repo> && cd pearl
 go build -o pearl .
 sudo cp pearl /usr/local/bin/pearl
 ```
@@ -40,6 +40,7 @@ sudo cp pearl /usr/local/bin/pearl
 ```
 pearl -u URL [-u MIRROR ...] [-c concurrency] [-o output]
       [-r retries] [-fresh] [-plain] [-http3] [-buf size] [-pipeline n]
+      [-max-speed rate]
 ```
 
 | Flag | Description | Default |
@@ -53,6 +54,7 @@ pearl -u URL [-u MIRROR ...] [-c concurrency] [-o output]
 | `-http3` | Try HTTP/3 over QUIC, falling back to TCP if it doesn't work | `false` |
 | `-buf` | Read/write chunk size per connection (`512K`, `4M`, …), between 64K and 64M | `512K` |
 | `-pipeline` | Chunks kept in flight per connection, between 2 and 16 | `3` |
+| `-max-speed` | Cap the whole download's rate (`2M`, `500K`, …) | unlimited |
 
 Exit codes: `0` success, `1` download error (checkpoint saved), `2` bad
 usage, `130` interrupted with Ctrl-C (checkpoint saved).
@@ -85,6 +87,12 @@ Resume an interrupted download — the same command, unchanged:
 
 ```
 pearl -u https://example.com/file.iso -o ~/Downloads/file.iso -c 16
+```
+
+Leave some bandwidth for everything else on the link:
+
+```
+pearl -u https://example.com/file.iso -max-speed 2M
 ```
 
 Throw away a saved checkpoint and start over:
@@ -261,6 +269,40 @@ so the bytes are retried rather than skipped.
 The lock is taken roughly once per 512 KiB written, which is far too
 infrequent to contend, and is never held across I/O.
 
+## Capping the rate
+
+`-max-speed` limits how fast the transfer runs, taking the same spellings as
+`-buf`, so `2M` means the same thing in both:
+
+```
+pearl -u https://example.com/file.iso -max-speed 2M
+```
+
+It is **one token bucket shared by every connection**, not one per
+connection. That is the number people actually mean — what pearl takes off
+the line in total — and a per-connection cap would silently multiply by `-c`,
+making `-max-speed 2M -c 8` a 16 MB/s download. Sharing one bucket also keeps
+the cap steady while ranges are stolen between connections and while mirrors
+are retired, because none of that changes how many tokens exist.
+
+The allowance is spent *after* each read rather than reserved before one.
+Bytes that have arrived cannot be un-received — by the time `Read` returns
+they are already off the network and in the socket buffer — so paying
+afterwards is what actually throttles the transfer: the worker stops reading,
+the socket buffer fills, the receive window closes, and the *server* slows
+down. That is the same backpressure `-pipeline` is sized around. Reserving in
+advance would add latency without changing how fast anything arrived.
+
+Two details keep the edges sane. The bucket always holds at least one whole
+`-buf` chunk, so a cap smaller than the chunk size runs slowly instead of
+waiting forever for tokens that could never accumulate. And it starts full,
+so a download short enough never to reach the cap finishes at full speed
+rather than paying for a limit it was not going to hit.
+
+Without the flag there is no limiter at all — the response body is passed
+through unwrapped, so an unthrottled download keeps exactly the read path it
+had.
+
 ## Disk and buffer behaviour
 
 ### The output file is really preallocated
@@ -400,7 +442,9 @@ getting past a server that throttles you, mirrors are the far bigger lever.
    run on separate goroutines connected by a small buffer pool, three
    buffers deep. The read for chunk N+1 proceeds while chunk N is still
    being written, instead of the two alternating serially. Writes go through
-   `WriteAt`, so all connections share one file handle with no seeking.
+   `WriteAt`, so all connections share one file handle with no seeking. Under
+   `-max-speed` the shared token bucket sits on the read side of this loop,
+   throttling by declining to read rather than by discarding anything.
 
 4. **Rebalancing.** As described above — idle connections steal from the
    slowest.
@@ -421,8 +465,8 @@ getting past a server that throttles you, mirrors are the far bigger lever.
 
 6. **Sequential fallback.** If the server won't serve ranges, or hides the
    content length, pearl streams the file on a single connection using the
-   same pipelined read/write path. There is nothing to rebalance and nothing
-   safe to resume, so no sidecar is written.
+   same pipelined read/write path — and the same rate limiter. There is
+   nothing to rebalance and nothing safe to resume, so no sidecar is written.
 
 ## Notes
 
@@ -440,6 +484,8 @@ getting past a server that throttles you, mirrors are the far bigger lever.
 - Very high `-c` values are often counterproductive. Many servers rate-limit
   per connection but also cap connections per client, and past a dozen or so
   you are mostly adding handshakes.
+- `-max-speed` caps the download as a whole, so it does not need adjusting
+  when you change `-c` or add mirrors.
 
 ## Tests
 
