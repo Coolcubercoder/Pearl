@@ -10,6 +10,7 @@ import (
 	"os"
 	"strings"
 	"sync"
+	"time"
 )
 
 // maxSourceFailures is how many consecutive failures retire a mirror for the
@@ -19,6 +20,13 @@ import (
 // there. The last surviving mirror is never retired -- with nowhere else to
 // send the bytes, the ordinary retry path is all we have.
 const maxSourceFailures = 3
+
+// maxThrottleRetries is how many consecutive 429s a mirror may answer before
+// it is sidelined as throttled rather than merely slow. Unlike a retired
+// mirror this is temporary and reversible: the point is to move load off a
+// server that is actively pushing back, not to write it off. A mirror that
+// answers one clean range clears its streak.
+const maxThrottleRetries = 5
 
 // verifyWindow is how many bytes are read from the middle of each candidate
 // mirror and compared against the primary before it is allowed to serve any
@@ -62,21 +70,25 @@ func (u *urlList) Set(value string) error {
 // those, and keeping the two apart is what lets a range be started on one
 // mirror and finished on another without any special handling.
 type sourcePool struct {
-	mu       sync.Mutex
-	sources  []source
-	failures []int
-	dead     []bool
-	load     []int // workers currently assigned to each mirror
-	assign   []int // worker id -> mirror index
+	mu        sync.Mutex
+	sources   []source
+	failures  []int
+	dead      []bool
+	load      []int       // workers currently assigned to each mirror
+	assign    []int       // worker id -> mirror index
+	throttles []int       // consecutive 429s per mirror
+	coolUntil []time.Time // mirror is sidelined until this instant
 }
 
 func newSourcePool(sources []source, workers int) *sourcePool {
 	p := &sourcePool{
-		sources:  sources,
-		failures: make([]int, len(sources)),
-		dead:     make([]bool, len(sources)),
-		load:     make([]int, len(sources)),
-		assign:   make([]int, workers),
+		sources:   sources,
+		failures:  make([]int, len(sources)),
+		dead:      make([]bool, len(sources)),
+		load:      make([]int, len(sources)),
+		assign:    make([]int, workers),
+		throttles: make([]int, len(sources)),
+		coolUntil: make([]time.Time, len(sources)),
 	}
 	for w := 0; w < workers; w++ {
 		idx := w % len(sources)
@@ -97,19 +109,34 @@ func (p *sourcePool) pick(worker int) (source, int, bool) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 
+	now := time.Now()
 	idx := p.assign[worker]
-	if !p.dead[idx] {
+	if p.usable(idx, now) {
 		return p.sources[idx], idx, true
 	}
 
-	best := -1
+	// Prefer a mirror that is neither retired nor cooling off. When every live
+	// mirror is cooling, fall back to the one whose cooldown expires soonest
+	// instead of reporting failure: a download where all the mirrors are
+	// pushing back should crawl, not die, and this worker has already served
+	// its own backoff before getting here.
+	best, coolest := -1, -1
 	for i := range p.sources {
 		if p.dead[i] {
 			continue
 		}
-		if best == -1 || p.load[i] < p.load[best] {
-			best = i
+		if p.usable(i, now) {
+			if best == -1 || p.load[i] < p.load[best] {
+				best = i
+			}
+			continue
 		}
+		if coolest == -1 || p.coolUntil[i].Before(p.coolUntil[coolest]) {
+			coolest = i
+		}
+	}
+	if best == -1 {
+		best = coolest
 	}
 	if best == -1 {
 		return source{}, -1, false
@@ -118,6 +145,12 @@ func (p *sourcePool) pick(worker int) (source, int, bool) {
 	p.load[best]++
 	p.assign[worker] = best
 	return p.sources[best], best, true
+}
+
+// usable reports whether a mirror is worth sending a request to right now:
+// neither retired for good nor sidelined for rate limiting.
+func (p *sourcePool) usable(idx int, now time.Time) bool {
+	return !p.dead[idx] && !now.Before(p.coolUntil[idx])
 }
 
 // succeed clears a mirror's failure streak. Only *consecutive* failures
@@ -129,7 +162,40 @@ func (p *sourcePool) succeed(idx int) {
 	}
 	p.mu.Lock()
 	p.failures[idx] = 0
+	// A completed range also clears the rate-limit streak and any sidelining:
+	// the mirror just proved it is serving again, which is better evidence
+	// than the cooldown we guessed at.
+	p.throttles[idx] = 0
+	p.coolUntil[idx] = time.Time{}
 	p.mu.Unlock()
+}
+
+// noteThrottle records a 429 from a mirror and reports how many it has now
+// answered in a row, which is what sizes the caller's exponential backoff.
+func (p *sourcePool) noteThrottle(idx int) int {
+	if idx < 0 {
+		return 1
+	}
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.throttles[idx]++
+	return p.throttles[idx]
+}
+
+// park sidelines a rate-limiting mirror for the length of its cooldown and
+// reports whether that is news. Unlike fail this never retires a mirror: a
+// throttled server is still a working server, and when it is the only one left
+// it stays in rotation and the per-worker pauses alone carry the backpressure.
+func (p *sourcePool) park(idx int, cooldown time.Duration) bool {
+	if idx < 0 {
+		return false
+	}
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	now := time.Now()
+	already := now.Before(p.coolUntil[idx])
+	p.coolUntil[idx] = now.Add(cooldown)
+	return !already
 }
 
 // fail records a failed transfer and reports whether it retired the mirror.

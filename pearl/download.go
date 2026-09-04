@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"os"
 	"strconv"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -43,6 +44,24 @@ const (
 	// checkpointPoll is how often those two conditions are tested. It is not
 	// how often anything is flushed.
 	checkpointPoll = 250 * time.Millisecond
+	// baseThrottleDelay is the pause after a mirror's first 429 that arrived
+	// without a Retry-After header, and it doubles with each consecutive one.
+	baseThrottleDelay = time.Second
+	// maxThrottleDelay caps that doubling, and also caps whatever a server
+	// asks for in Retry-After. A header is a hint from a machine we do not
+	// control: a misconfigured edge node answering "Retry-After: 86400" must
+	// slow the download down, not park it for a day with no way to tell that
+	// anything is still alive.
+	maxThrottleDelay = 60 * time.Second
+	// throttlePoll is how often a paused worker checks whether the download
+	// still needs it. It costs nothing while nothing is throttled.
+	throttlePoll = 250 * time.Millisecond
+	// maxStreamThrottleStall bounds how long the single-stream path will keep
+	// waiting out 429s. That path has no ranges to resume from and no second
+	// connection making progress in the meantime, so a server that keeps
+	// refusing means the download is achieving nothing at all: at some point
+	// saying so beats retrying in silence forever.
+	maxStreamThrottleStall = 5 * time.Minute
 )
 
 // bufferPool recycles copy buffers across segments. Without it, every segment,
@@ -90,6 +109,86 @@ var errSegmentDone = errors.New("segment complete")
 
 var errInterrupted = errors.New("interrupted")
 
+// throttleError reports that a mirror answered 429 Too Many Requests.
+//
+// It is carried up to runWorker rather than handled where it is detected,
+// because the first thing a throttled worker owes everyone else is its range:
+// waiting where the 429 was seen would hold a segment hostage for the whole
+// penalty while other connections sat idle.
+type throttleError struct {
+	label  string        // mirror that pushed back, for the matrix
+	hint   time.Duration // Retry-After, or 0 when the server sent none
+	wait   time.Duration // what this worker actually pauses for
+	parked bool          // the mirror has now been sidelined as throttled
+}
+
+func (e *throttleError) Error() string {
+	if e.hint > 0 {
+		return fmt.Sprintf("429 from %s, honouring Retry-After %s", e.label, e.wait.Round(time.Second))
+	}
+	return fmt.Sprintf("429 from %s, backing off %s", e.label, e.wait.Round(time.Second))
+}
+
+// parseRetryAfter reads a Retry-After header, returning 0 when there is no
+// usable instruction in it and the caller should fall back to its own backoff.
+//
+// RFC 9110 allows the value to be either a delta-seconds count or an
+// HTTP-date, and real CDNs send both, so an integer-only parser would silently
+// ignore the servers that did bother to say how long to wait -- exactly the
+// servers worth listening to. A date already in the past means "now", which is
+// a hint to back off by the local minimum rather than to hammer immediately.
+func parseRetryAfter(value string, now time.Time) time.Duration {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return 0
+	}
+	if seconds, err := strconv.Atoi(value); err == nil {
+		if seconds <= 0 {
+			return 0
+		}
+		return time.Duration(seconds) * time.Second
+	}
+	if when, err := http.ParseTime(value); err == nil {
+		if delay := when.Sub(now); delay > 0 {
+			return delay
+		}
+	}
+	return 0
+}
+
+// throttleWait sizes the pause after a 429: the server's own Retry-After when
+// it sent one, and the doubling ladder when it did not. Either way the result
+// is capped, because a header is a hint from a machine we do not control.
+func throttleWait(hint time.Duration, streak int) time.Duration {
+	wait := hint
+	if wait <= 0 {
+		wait = throttleBackoff(streak)
+	}
+	if wait > maxThrottleDelay {
+		wait = maxThrottleDelay
+	}
+	return wait
+}
+
+// throttleBackoff is the pause after the n-th consecutive 429 from a mirror
+// that sent no Retry-After: one second, then two, four, eight, sixteen. The
+// exponent is clamped at maxThrottleRetries rather than left to run, because
+// a streak that keeps growing would otherwise shift its way to a delay no
+// download could outlive.
+func throttleBackoff(n int) time.Duration {
+	if n < 1 {
+		n = 1
+	}
+	if n > maxThrottleRetries {
+		n = maxThrottleRetries
+	}
+	delay := baseThrottleDelay << uint(n-1)
+	if delay > maxThrottleDelay {
+		delay = maxThrottleDelay
+	}
+	return delay
+}
+
 type downloader struct {
 	clients    *clientSet
 	outputPath string
@@ -103,6 +202,9 @@ type downloader struct {
 	co      *coordinator
 	stats   []*workerStat
 	meter   *atomic.Int64
+	// limits is shared by every worker so that -max-speed caps the download
+	// rather than each connection. Nil when no cap was asked for.
+	limits *rateLimiter
 }
 
 // chunk is a filled read buffer handed from the reader goroutine to the
@@ -232,18 +334,74 @@ func (d *downloader) runWorker(ctx context.Context, id int) error {
 			stat.setState(stateDone)
 			return nil
 		}
-		if err := d.fetchSegment(ctx, id, seg); err != nil {
-			// Hand the range back so its remaining bytes are still described by
-			// the checkpoint and can be picked up on the next run.
-			d.co.release(seg)
-			if ctx.Err() != nil {
-				stat.setState(stateIdle)
-				return ctx.Err()
-			}
-			stat.setState(stateFailed)
-			return err
-		}
+		err := d.fetchSegment(ctx, id, seg)
+		// Hand the range back however the attempt ended, so its remaining bytes
+		// are still described by the checkpoint and can be picked up on the next
+		// run. For a throttled worker this ordering is the whole point: the
+		// range is back in the pool before the pause begins, so an un-throttled
+		// connection can claim or steal it rather than waiting out a penalty
+		// that was never charged to it.
 		d.co.release(seg)
+		if err == nil {
+			continue
+		}
+
+		// A 429 is not a failed download, it is a server asking for less load.
+		// The worker sits out its pause and then goes back for whatever work is
+		// left -- which may be this same range, if nobody faster took it.
+		var throttle *throttleError
+		if errors.As(err, &throttle) {
+			if waitErr := d.waitOutThrottle(ctx, id, throttle); waitErr != nil {
+				stat.setState(stateIdle)
+				return waitErr
+			}
+			continue
+		}
+
+		if ctx.Err() != nil {
+			stat.setState(stateIdle)
+			return ctx.Err()
+		}
+		stat.setState(stateFailed)
+		return err
+	}
+}
+
+// waitOutThrottle parks one worker for the length of its 429 penalty.
+//
+// The pause is a select on the context rather than a bare time.Sleep: a sleep
+// cannot be woken, so a cancelled download -- Ctrl-C, or another worker's
+// fatal error -- would have to sit out the server's full Retry-After before
+// anything could stop, and the checkpoint it owes would be that late too.
+func (d *downloader) waitOutThrottle(ctx context.Context, id int, throttle *throttleError) error {
+	stat := d.stats[id]
+	stat.setState(stateThrottled)
+	stat.setNote(throttle)
+	if throttle.parked {
+		fmt.Fprintf(os.Stderr, "\npearl: mirror %s is rate-limiting, sidelining it for %s\n",
+			throttle.label, throttle.wait.Round(time.Second))
+	}
+	deadline := time.NewTimer(throttle.wait)
+	defer deadline.Stop()
+
+	// Wake early once there is nothing left to fetch. run waits for every
+	// worker, so without this a connection that drew a long Retry-After would
+	// hold the whole download open well after the un-throttled mirrors had
+	// written the last byte -- the transfer would be finished on disk and still
+	// be sitting there waiting out somebody else's penalty.
+	poll := time.NewTicker(throttlePoll)
+	defer poll.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-deadline.C:
+			return nil
+		case <-poll.C:
+			if d.co.remaining() == 0 {
+				return nil
+			}
+		}
 	}
 }
 
@@ -287,6 +445,26 @@ func (d *downloader) fetchSegment(ctx context.Context, id int, seg *segment) err
 		if ctx.Err() != nil {
 			return ctx.Err()
 		}
+
+		// Rate limiting is deliberately kept out of the failure streak that
+		// retires a mirror. A firewall that answers 429 on every connection
+		// would otherwise retire each mirror in turn and fail a download that
+		// was only ever being asked to slow down -- and retiring mirrors makes
+		// that worse, by concentrating the same load on the ones still standing.
+		var throttle *throttleError
+		if errors.As(err, &throttle) {
+			streak := d.sources.noteThrottle(idx)
+			throttle.wait = throttleWait(throttle.hint, streak)
+			// Past the retry cap this mirror has proved it means it, so it is
+			// sidelined for the length of the pause and pick steers other
+			// workers to mirrors that are still answering.
+			if streak >= maxThrottleRetries {
+				throttle.parked = d.sources.park(idx, throttle.wait)
+			}
+			stat.setNote(throttle)
+			return throttle
+		}
+
 		if d.sources.fail(idx) {
 			fmt.Fprintf(os.Stderr, "\npearl: dropping mirror %s after %d consecutive failures (%v)\n",
 				src.label, maxSourceFailures, err)
@@ -332,12 +510,23 @@ func (d *downloader) fetchOnce(ctx context.Context, id int, seg *segment, start,
 		return err
 	}
 	defer response.Body.Close()
+	// Stop before a single byte is copied. Nothing has been read yet, so the
+	// segment's position is untouched and the range is clean to hand back --
+	// which is what lets the pause happen with the work released rather than
+	// held.
+	if response.StatusCode == http.StatusTooManyRequests {
+		return &throttleError{
+			label: src.label,
+			hint:  parseRetryAfter(response.Header.Get("Retry-After"), time.Now()),
+		}
+	}
 	if response.StatusCode != http.StatusPartialContent {
 		return fmt.Errorf("expected 206, got %s", response.Status)
 	}
 
 	stat.setState(stateDownloading)
-	_, err = d.pipe.copy(cancel, response.Body, func(buf []byte) (int, error) {
+	body := newLimitedReader(reqCtx, response.Body, d.limits)
+	_, err = d.pipe.copy(cancel, body, func(buf []byte) (int, error) {
 		// Reserve on every chunk rather than trusting the range we asked for:
 		// another worker may have stolen this segment's tail since the last
 		// chunk, in which case these bytes are already someone else's job.
@@ -391,6 +580,61 @@ func (d *downloader) checkpointLoop(done <-chan struct{}) {
 			lastAt, lastBytes = time.Now(), written
 		case <-done:
 			return
+		}
+	}
+}
+
+// awaitStream issues a plain, unranged GET and waits out any 429 the server
+// answers it with, returning the first response that is not a rate-limit
+// refusal.
+//
+// The ranged path handles a 429 by handing its segment back so another
+// connection can take it. This path has neither: one stream, no ranges, and
+// nothing to resume from, so the only thing it can do is ask again later --
+// which makes the give-up bound the important part. Retrying a single refused
+// stream forever would look exactly like a hung download.
+func awaitStream(ctx context.Context, client *http.Client, url string, stat *workerStat, stall time.Duration) (*http.Response, error) {
+	deadline := time.Now().Add(stall)
+	for streak := 1; ; streak++ {
+		stat.setState(stateConnecting)
+		request, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+		if err != nil {
+			return nil, err
+		}
+		response, err := client.Do(request)
+		if err != nil {
+			return nil, err
+		}
+		if response.StatusCode != http.StatusTooManyRequests {
+			return response, nil
+		}
+		// Nothing in a 429 body is worth reading, and the next attempt wants a
+		// clean connection rather than an undrained one.
+		response.Body.Close()
+
+		throttle := &throttleError{
+			label: shortHost(url),
+			hint:  parseRetryAfter(response.Header.Get("Retry-After"), time.Now()),
+		}
+		throttle.wait = throttleWait(throttle.hint, streak)
+		// Stop before sleeping past the bound rather than after: waiting out a
+		// pause we already know is pointless helps nobody.
+		if time.Now().Add(throttle.wait).After(deadline) {
+			stat.setState(stateFailed)
+			stat.setNote(throttle)
+			return nil, fmt.Errorf("rate limited with no progress for %s: %w", stall, throttle)
+		}
+		stat.setState(stateThrottled)
+		stat.setNote(throttle)
+
+		// Interruptible, for the same reason the ranged path is: a cancelled
+		// download must not have to sit out the server's Retry-After first.
+		timer := time.NewTimer(throttle.wait)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return nil, ctx.Err()
+		case <-timer.C:
 		}
 	}
 }

@@ -29,6 +29,7 @@ type config struct {
 	http3         bool
 	bufferSize    int
 	pipelineDepth int
+	maxSpeed      int64 // bytes per second across the whole download; 0 means no cap
 }
 
 func main() {
@@ -42,6 +43,7 @@ func main() {
 	flag.BoolVar(&cfg.plain, "plain", false, "print plain progress lines instead of the live matrix")
 	flag.BoolVar(&cfg.http3, "http3", false, "try HTTP/3 over QUIC, falling back to TCP if it does not work")
 	bufText := flag.String("buf", "512K", "read/write chunk size per connection (e.g. 512K, 4M)")
+	maxSpeedText := flag.String("max-speed", "", "cap the whole download's speed (e.g. 2M); unlimited when unset")
 	flag.IntVar(&cfg.pipelineDepth, "pipeline", defaultPipelineDepth, "chunks kept in flight per connection")
 	flag.Usage = func() {
 		fmt.Fprintf(flag.CommandLine.Output(), "Usage: pearl -u URL [-u MIRROR ...] [-c concurrency] [-o output]\n\n")
@@ -80,6 +82,17 @@ func main() {
 		os.Exit(2)
 	}
 	cfg.bufferSize = int(size)
+
+	// -max-speed takes the same spellings as -buf, so "2M" means the same
+	// thing in both. Left unset it stays zero, which is the no-cap case.
+	if *maxSpeedText != "" {
+		speed, err := parseSize(*maxSpeedText)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "pearl: -max-speed: %v\n", err)
+			os.Exit(2)
+		}
+		cfg.maxSpeed = speed
+	}
 
 	// Buffers are per connection, so the three flags multiply. Say so rather
 	// than quietly reserving a surprising amount of memory.
@@ -325,6 +338,7 @@ func rangedRun(ctx context.Context, clients *clientSet, cfg config, info probeRe
 		pipe:       newPipeline(cfg.bufferSize, cfg.pipelineDepth),
 		co:         newCoordinator(views),
 		meter:      meter,
+		limits:     newRateLimiter(cfg.maxSpeed, cfg.bufferSize),
 	}
 	for i := 0; i < cfg.concurrency; i++ {
 		stat := &workerStat{}
@@ -455,7 +469,8 @@ func sequentialRun(ctx context.Context, clients *clientSet, cfg config, info pro
 	go func() { defer background.Done(); view.run(done) }()
 
 	started := time.Now()
-	err := streamToFile(ctx, clients.probeClient(), cfg.output, info, newPipeline(cfg.bufferSize, cfg.pipelineDepth), stats[0], meter)
+	err := streamToFile(ctx, clients.probeClient(), cfg.output, info, newPipeline(cfg.bufferSize, cfg.pipelineDepth), stats[0], meter,
+		newRateLimiter(cfg.maxSpeed, cfg.bufferSize))
 
 	close(done)
 	background.Wait()
@@ -467,16 +482,11 @@ func sequentialRun(ctx context.Context, clients *clientSet, cfg config, info pro
 	return reportSuccess(cfg.output, meter.Load(), meter.Load(), started, 0)
 }
 
-func streamToFile(ctx context.Context, client *http.Client, outputPath string, info probeResult, pipe *pipeline, stat *workerStat, meter *atomic.Int64) error {
+func streamToFile(ctx context.Context, client *http.Client, outputPath string, info probeResult, pipe *pipeline, stat *workerStat, meter *atomic.Int64, limits *rateLimiter) error {
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
 
-	stat.setState(stateConnecting)
-	request, err := http.NewRequestWithContext(ctx, http.MethodGet, info.url, nil)
-	if err != nil {
-		return fmt.Errorf("download: %w", err)
-	}
-	response, err := client.Do(request)
+	response, err := awaitStream(ctx, client, info.url, stat, maxStreamThrottleStall)
 	if err != nil {
 		return fmt.Errorf("download: %w", err)
 	}
@@ -497,7 +507,7 @@ func streamToFile(ctx context.Context, client *http.Client, outputPath string, i
 	}
 
 	stat.setState(stateDownloading)
-	downloaded, err := pipe.copy(cancel, response.Body, func(buf []byte) (int, error) {
+	downloaded, err := pipe.copy(cancel, newLimitedReader(ctx, response.Body, limits), func(buf []byte) (int, error) {
 		n, err := file.Write(buf)
 		stat.bytes.Add(int64(n))
 		meter.Add(int64(n))
@@ -535,4 +545,5 @@ func reportSuccess(outputPath string, totalSize, sessionBytes int64, started tim
 	}
 	fmt.Println()
 	return nil
-}
+} 
+

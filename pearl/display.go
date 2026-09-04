@@ -16,6 +16,7 @@ const (
 	stateDownloading
 	stateStealing
 	stateRetrying
+	stateThrottled
 	stateDone
 	stateFailed
 )
@@ -26,6 +27,7 @@ var stateNames = map[int32]string{
 	stateDownloading: "downloading",
 	stateStealing:    "stealing",
 	stateRetrying:    "retrying",
+	stateThrottled:   "throttled",
 	stateDone:        "done",
 	stateFailed:      "failed",
 }
@@ -498,7 +500,7 @@ func (d *display) workerLine(width, id int, stat *workerStat) string {
 
 	// Only a stalled or broken connection gets to spend the rest of the line
 	// explaining itself — that is exactly what the matrix is for.
-	if note := stat.noteText(); note != "" && (state == stateRetrying || state == stateFailed) {
+	if note := stat.noteText(); note != "" && (state == stateRetrying || state == stateThrottled || state == stateFailed) {
 		parts = append(parts, span{text: "  " + note, style: styleDim})
 	}
 	return renderSpans(parts, width, d.color)
@@ -508,7 +510,7 @@ func (d *display) stateStyle(state int32) string {
 	switch state {
 	case stateDownloading:
 		return styleGreen
-	case stateRetrying:
+	case stateRetrying, stateThrottled:
 		return styleYellow
 	case stateFailed:
 		return styleRed

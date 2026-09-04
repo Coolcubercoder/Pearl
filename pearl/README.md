@@ -40,6 +40,7 @@ sudo cp pearl /usr/local/bin/pearl
 ```
 pearl -u URL [-u MIRROR ...] [-c concurrency] [-o output]
       [-r retries] [-fresh] [-plain] [-http3] [-buf size] [-pipeline n]
+      [-max-speed rate]
 ```
 
 | Flag | Description | Default |
@@ -53,6 +54,7 @@ pearl -u URL [-u MIRROR ...] [-c concurrency] [-o output]
 | `-http3` | Try HTTP/3 over QUIC, falling back to TCP if it doesn't work | `false` |
 | `-buf` | Read/write chunk size per connection (`512K`, `4M`, …), between 64K and 64M | `512K` |
 | `-pipeline` | Chunks kept in flight per connection, between 2 and 16 | `3` |
+| `-max-speed` | Cap the whole download's rate (`2M`, `500K`, …) | unlimited |
 
 Exit codes: `0` success, `1` download error (checkpoint saved), `2` bad
 usage, `130` interrupted with Ctrl-C (checkpoint saved).
@@ -85,6 +87,12 @@ Resume an interrupted download — the same command, unchanged:
 
 ```
 pearl -u https://example.com/file.iso -o ~/Downloads/file.iso -c 16
+```
+
+Leave some bandwidth for everything else on the link:
+
+```
+pearl -u https://example.com/file.iso -max-speed 2M
 ```
 
 Throw away a saved checkpoint and start over:
@@ -150,8 +158,9 @@ glance.
 
 Each row shows the byte range that connection currently owns, how far
 through that range it is, its transfer rate, and its state — `connecting`,
-`downloading`, `stealing`, `retrying`, `done`, or `failed`. A connection
-that is retrying or has failed spends the rest of its line explaining why.
+`downloading`, `stealing`, `retrying`, `throttled`, `done`, or `failed`. A
+connection that is retrying, throttled, or has failed spends the rest of its
+line explaining why.
 
 With mirrors, a `mirror` column shows which one each connection is currently
 pulling from, and turns red when that mirror has been retired — so a
@@ -260,6 +269,146 @@ so the bytes are retried rather than skipped.
 
 The lock is taken roughly once per 512 KiB written, which is far too
 infrequent to contend, and is never held across I/O.
+
+## Capping the rate
+
+`-max-speed` limits how fast the transfer runs, taking the same spellings as
+`-buf`, so `2M` means the same thing in both:
+
+```
+pearl -u https://example.com/file.iso -max-speed 2M
+```
+
+It is **one token bucket shared by every connection**, not one per
+connection. That is the number people actually mean — what pearl takes off
+the line in total — and a per-connection cap would silently multiply by `-c`,
+making `-max-speed 2M -c 8` a 16 MB/s download. Sharing one bucket also keeps
+the cap steady while ranges are stolen between connections and while mirrors
+are retired, because none of that changes how many tokens exist.
+
+The allowance is spent *after* each read rather than reserved before one.
+Bytes that have arrived cannot be un-received — by the time `Read` returns
+they are already off the network and in the socket buffer — so paying
+afterwards is what actually throttles the transfer: the worker stops reading,
+the socket buffer fills, the receive window closes, and the *server* slows
+down. That is the same backpressure `-pipeline` is sized around. Reserving in
+advance would add latency without changing how fast anything arrived.
+
+Two details keep the edges sane. The bucket always holds at least one whole
+`-buf` chunk, so a cap smaller than the chunk size runs slowly instead of
+waiting forever for tokens that could never accumulate. And it starts full,
+so a download short enough never to reach the cap finishes at full speed
+rather than paying for a limit it was not going to hit.
+
+Without the flag there is no limiter at all — the response body is passed
+through unwrapped, so an unthrottled download keeps exactly the read path it
+had.
+
+## When the server caps you
+
+`-max-speed` is you throttling yourself. A `429 Too Many Requests` is a server
+throttling you, and the two want opposite handling: a cap is a number to
+respect continuously, a 429 is a one-off instruction to back off and come back
+later.
+
+pearl inspects the status of every ranged response **before it copies a single
+byte**. A 429 stops that attempt where it stands, which means nothing has been
+read, the range's position is untouched, and the range is clean to hand back.
+
+### The range goes back before the wait starts
+
+This is the part that matters for a parallel downloader. A throttled
+connection **releases its range to the coordinator first and waits second**,
+so the bytes it was holding drop straight back into the pool where an
+un-throttled connection can claim or steal them. Waiting where the 429 was
+seen would pin a range for the length of the penalty while other connections
+sat idle with nothing to do — turning one server's rate limit into a stall
+across the whole download.
+
+When the worker wakes it goes back for whatever work is left, which may be the
+same range if nobody faster took it in the meantime.
+
+### How long it waits
+
+If the server sent a `Retry-After`, pearl uses that. Both forms in RFC 9110
+are accepted — a delta-seconds count (`Retry-After: 30`) and an HTTP-date
+(`Retry-After: Wed, 02 Sep 2026 12:00:30 GMT`) — because real CDNs send both,
+and an integer-only parser would ignore exactly the servers that bothered to
+say how long to wait.
+
+The value is **capped at 60 seconds**. A header is a hint from a machine you
+do not control, and a misconfigured edge node answering `Retry-After: 86400`
+should slow a download down, not park it for a day with no sign of life.
+
+With no usable header, pearl falls back to its own doubling ladder — 1s, 2s,
+4s, 8s, 16s — and the exponent stops there rather than shifting its way to a
+delay nothing could outlive. The streak is counted **per mirror, not per
+connection**: every connection that lands on the same throttled server
+advances the same count, so the backoff tracks how hard that server is pushing
+back rather than how unlucky one connection has been.
+
+### A rate-limited mirror is sidelined, not retired
+
+[Mirrors](#multi-source-mirroring) are retired for the rest of the run after
+three consecutive failures. **Rate limiting deliberately does not count toward
+that streak.** A firewall answering 429 on every connection would otherwise
+retire each mirror in turn and fail a download that was only ever being asked
+to slow down — and retiring mirrors makes that worse, by concentrating the
+same load onto the ones still standing.
+
+Instead, after five consecutive 429s a mirror is sidelined for the length of
+its current backoff:
+
+```
+pearl: mirror nl is rate-limiting, sidelining it for 16s
+```
+
+Sidelining is temporary and reversible. Connections are steered around the
+mirror while it cools, and **one completed range clears both the streak and
+the sidelining** — a server that just served bytes is better evidence than any
+cooldown we guessed at. A sidelined mirror still counts as alive, so this
+never trips the failover path.
+
+If every mirror is cooling at once, pearl still picks one — whichever's
+cooldown expires first — rather than reporting failure. A download where every
+server is pushing back should crawl, not die.
+
+### What you see
+
+The row goes yellow, reads `throttled`, and spends the rest of its line saying
+why:
+
+```
+  #   mirror   range         progress                     rate  state
+  2   nl       1.9G→2.8G     ███████░░░░░░░░  35.2%  9.28 MiB/s  downloading
+  3   cdimage  2.8G→3.8G     ██░░░░░░░░░░░░░   8.1%       0 B/s  throttled  429 from cdimage, honouring Retry-After 30s
+```
+
+The waiting is interruptible. Ctrl-C during a throttle stops immediately,
+because the pause is a select on the download's context rather than a bare
+sleep — otherwise a stop would have to sit out the server's full `Retry-After`
+before anything could shut down, and the checkpoint it owes would be that late
+too. A worker also wakes early once there is nothing left to fetch, so a
+connection that drew a 60-second penalty can't hold the download open after
+the un-throttled mirrors have already written the last byte.
+
+### Two deliberate limits
+
+- **A download where every mirror rate-limits forever crawls; it does not
+  fail.** Workers keep releasing, waiting (60 seconds at most) and retrying for
+  as long as you let them run. That is the intent rather than a gap: backing
+  off for as long as it takes is the whole point of handling a 429, and pearl
+  has no way to know whether a server that refused you a minute ago will
+  relent on the next attempt. It stays interruptible and checkpointed
+  throughout, so Ctrl-C and a later rerun pick up where you left off. Worth
+  knowing if you are upgrading: older versions spent the `-r` retry budget on
+  a 429 and then failed the download outright.
+- **The single-stream path treats a 429 as a plain error.** When a server
+  refuses range requests, pearl falls back to one unranged connection, and
+  that path fails on a 429 the way it fails on any other unexpected status.
+  None of the above applies there — there are no ranges to release and no
+  coordinator to hand them to — and one sequential connection is not what gets
+  you rate-limited in the first place.
 
 ## Disk and buffer behaviour
 
@@ -400,7 +549,9 @@ getting past a server that throttles you, mirrors are the far bigger lever.
    run on separate goroutines connected by a small buffer pool, three
    buffers deep. The read for chunk N+1 proceeds while chunk N is still
    being written, instead of the two alternating serially. Writes go through
-   `WriteAt`, so all connections share one file handle with no seeking.
+   `WriteAt`, so all connections share one file handle with no seeking. Under
+   `-max-speed` the shared token bucket sits on the read side of this loop,
+   throttling by declining to read rather than by discarding anything.
 
 4. **Rebalancing.** As described above — idle connections steal from the
    slowest.
@@ -421,8 +572,8 @@ getting past a server that throttles you, mirrors are the far bigger lever.
 
 6. **Sequential fallback.** If the server won't serve ranges, or hides the
    content length, pearl streams the file on a single connection using the
-   same pipelined read/write path. There is nothing to rebalance and nothing
-   safe to resume, so no sidecar is written.
+   same pipelined read/write path — and the same rate limiter. There is
+   nothing to rebalance and nothing safe to resume, so no sidecar is written.
 
 ## Notes
 
@@ -440,6 +591,11 @@ getting past a server that throttles you, mirrors are the far bigger lever.
 - Very high `-c` values are often counterproductive. Many servers rate-limit
   per connection but also cap connections per client, and past a dozen or so
   you are mostly adding handshakes.
+- `-max-speed` caps the download as a whole, so it does not need adjusting
+  when you change `-c` or add mirrors.
+- A server answering `429` is telling you `-c` is too high for it. Mirrors
+  help here and more connections do not: see [When the server caps
+  you](#when-the-server-caps-you).
 
 ## Tests
 
@@ -461,6 +617,23 @@ different bytes at the same content length is rejected at probe time, a
 mirror that dies mid-transfer is retired and its work finishes elsewhere, and
 the assembled file is compared byte for byte against the source in both
 cases.
+
+Rate-limit handling is covered at both levels. The parsing and backoff pieces
+are unit-tested directly — `Retry-After` in both its delta-seconds and
+HTTP-date forms, plus the empty, negative, past-dated and unparseable values
+that have to fall back to the local ladder, and that the ladder doubles and
+then clamps. The source pool is tested for the properties that keep a
+throttled mirror usable: streaks counted per mirror, connections steered away
+from a sidelined one, a mirror never retired for rate limiting, a success
+clearing the sidelining, and a pick still returning a mirror when every one of
+them is cooling. End to end against local servers, a download honours a
+`Retry-After` before retrying, completes byte for byte with one mirror
+answering 429 to everything while leaving that mirror un-retired, and finishes
+in the time the healthy mirror needs rather than the time the backoff ladder
+would take — which is what actually pins down that a throttled worker releases
+its range before waiting instead of sleeping on it. One more test cancels a
+download mid-throttle and asserts it returns promptly rather than sitting out
+the server's `Retry-After`.
 
 The I/O path is covered too: chunk round-tripping at several pipeline depths,
 read and write error propagation, buffer reuse (via an allocation count),
